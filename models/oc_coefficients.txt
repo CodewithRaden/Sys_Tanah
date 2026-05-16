@@ -1,0 +1,18 @@
+
+// ================================================================
+// Estimasi OC (C-Organik) via Pedotransfer Function
+// Referensi: Rasio C/N + faktor pH (disesuaikan dengan dataset)
+// Dataset  : dataset1.csv | R² = 0.0012
+//
+// Formula  :
+//   N_pct = N_mgkg / 10000.0          (konversi mg/kg → %)
+//   OC_est = 0.5509
+//          + 3.4052 * N_pct
+//          + 0.0331 * (7.0 - pH)
+//   OC_est = constrain(OC_est, 0.100, 24.000)
+// ================================================================
+const float OC_A0   = 0.550886f;
+const float OC_AN   = 3.405174f;  // koef N (dalam %)
+const float OC_APH  = 0.033136f; // koef (7 - pH)
+const float OC_MIN_ = 0.1000f;
+const float OC_MAX_ = 24.0000f;
