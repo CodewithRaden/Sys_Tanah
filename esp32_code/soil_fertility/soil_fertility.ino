@@ -84,15 +84,15 @@ void addRecord(float hum, float temp, float n, float p, float k, float ph, float
 }
 
 // --- WiFi Configuration ---
-const char* WIFI_SSID = "Raden_2nd";
-const char* WIFI_PASS = "onlyraden123";
+const char* WIFI_SSID = "punyaraden";
+const char* WIFI_PASS = "gakgratis";
 
 // --- Supabase Configuration ---
 const char* SUPABASE_URL = "https://zngqajfkegxhwwjoocka.supabase.co/rest/v1/soil_measurements";
 const char* SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpuZ3FhamZrZWd4aHd3am9vY2thIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg2NjQwODUsImV4cCI6MjA5NDI0MDA4NX0.ShtqLC3CIxx2m3TVNbcZX5VftLFLbJCSkZAfr8wCNrE";
 
 unsigned long lastSupabaseUpdate = 0;
-const unsigned long SUPABASE_INTERVAL = 0; // 0 detik (kirim terus)
+const unsigned long SUPABASE_INTERVAL = 60000; // 60 detik (kirim terus)
 
 // --- Pin MAX485 ---
 #define DE_PIN  4
@@ -278,10 +278,10 @@ void showResult(int pred,
   Serial.printf(" Kelembaban : %5.1f %%\n",   hum);
   Serial.printf(" Suhu       : %5.1f degC\n", temp);
   Serial.println("------------------------------------");
-  Serial.printf(" N  : %6.1f mg/kg\n", n);
-  Serial.printf(" P  : %6.1f mg/kg\n", p);
-  Serial.printf(" K  : %6.1f mg/kg\n", k);
-  Serial.printf(" pH : %6.2f\n",        ph);
+  Serial.printf(" N  : %6.0f mg/kg\n", n);
+  Serial.printf(" P  : %6.0f mg/kg\n", p);
+  Serial.printf(" K  : %6.0f mg/kg\n", k);
+  Serial.printf(" pH : %6.1f\n",        ph);
   Serial.printf(" EC : %6d us/cm\n",    (int)ec);
   Serial.printf(" OC : %6.2f %%  (est)\n", oc);
   Serial.println("====================================");
@@ -324,14 +324,14 @@ void showResult(int pred,
   lcdPrint(1, r);
 
   // -- Baris 2: pH dan EC --
-  snprintf(r, sizeof(r), "pH: %.2f   EC: %4d", ph, (int)ec);
+  snprintf(r, sizeof(r), "pH: %.1f   EC: %4d", ph, (int)ec);
   lcdPrint(2, r);
 
   // -- Baris 3: OC estimasi --
   snprintf(r, sizeof(r), "OC est:  %5.2f %%", oc);
   lcdPrint(3, r);
 
-  delay(1000); // Dipercepat untuk koleksi data (awalnya 10 detik)
+  delay(10000); 
 
   // ========================================================
   // HALAMAN 2 — Hasil AI + Rekomendasi
