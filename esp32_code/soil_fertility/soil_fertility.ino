@@ -27,9 +27,7 @@
 #include <Wire.h>                // I2C
 #include <LiquidCrystal_I2C.h>   // LCD I2C
 #include <WiFi.h>                // WiFi Library
-#include <HTTPClient.h>          // HTTP Client
-#include <WiFiClientSecure.h>    // HTTPS
-#include <ArduinoJson.h>         // JSON for Supabase & ThingsBoard
+#include <ArduinoJson.h>         // JSON for ThingsBoard
 #include <PubSubClient.h>        // MQTT for ThingsBoard
 #include <time.h>                // NTP Time Sync
 #include <sntp.h>
@@ -39,12 +37,7 @@
 const char* WIFI_SSID = "Itsme";
 const char* WIFI_PASS = "1234567899";
 
-// --- Supabase Configuration ---
-const char* SUPABASE_URL = "https://zngqajfkegxhwwjoocka.supabase.co/rest/v1/soil_measurements";
-const char* SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpuZ3FhamZrZWd4aHd3am9vY2thIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg2NjQwODUsImV4cCI6MjA5NDI0MDA4NX0.ShtqLC3CIxx2m3TVNbcZX5VftLFLbJCSkZAfr8wCNrE";
-
-unsigned long lastSupabaseUpdate = 0;
-const unsigned long SUPABASE_INTERVAL = 60000; // 60 detik
+// --- Konfigurasi Supabase dihapus: Kini diteruskan lewat ThingsBoard Rule Engine ---
 
 // ============================
 // THINGSBOARD CONFIG
@@ -67,7 +60,7 @@ void saveDataLocally(String data) {
   }
 }
 
-// FUNGSI UNTUK MENGIRIM DATA TERSIMPAN (Satu per satu agar aman dari Error 400 Keys Mismatch)
+// FUNGSI UNTUK MENGIRIM DATA TERSIMPAN VIA MQTT
 void syncUnsentData() {
   if (!SPIFFS.exists("/unsent.txt")) return;
 
@@ -91,10 +84,6 @@ void syncUnsentData() {
   int successCount = 0;
   int failCount = 0;
   String rewriteData = "";
-  
-  WiFiClientSecure client;
-  client.setInsecure(); // Bypass SSL verification
-  HTTPClient http;
 
   while (pos < allData.length()) {
     int endLine = allData.indexOf('\n', pos);
@@ -107,50 +96,30 @@ void syncUnsentData() {
     StaticJsonDocument<512> lineDoc;
     DeserializationError err = deserializeJson(lineDoc, line);
     if (!err) {
-      // 1. Kirim historis ke MQTT jika ada epoch_ms
       if (tbClient.connected() && lineDoc.containsKey("epoch_ms")) {
         StaticJsonDocument<512> hDoc;
         hDoc["ts"] = lineDoc["epoch_ms"];
         JsonObject vals = hDoc.createNestedObject("values");
-        vals["humidity"]    = lineDoc["Hum"];
-        vals["temperature"] = lineDoc["Temp"];
-        vals["n"]           = lineDoc["N"];
-        vals["p"]           = lineDoc["P"];
-        vals["k"]           = lineDoc["K"];
-        vals["ph"]          = lineDoc["pH"];
-        vals["ec"]          = lineDoc["EC"];
+        // Karena di SPIFFS kita simpan pakai huruf kecil (sesuai keys MQTT), kita ambil huruf kecil:
+        vals["humidity"]    = lineDoc["humidity"];
+        vals["temperature"] = lineDoc["temperature"];
+        vals["n"]           = lineDoc["n"];
+        vals["p"]           = lineDoc["p"];
+        vals["k"]           = lineDoc["k"];
+        vals["ph"]          = lineDoc["ph"];
+        vals["ec"]          = lineDoc["ec"];
         vals["ai_label"]    = lineDoc["ai_label"];
         vals["recommendation"] = lineDoc["recommendation"];
         
         String hPayload;
         serializeJson(hDoc, hPayload);
-        tbClient.publish("v1/devices/me/telemetry", hPayload.c_str());
-        delay(30); // Kasih nafas untuk MQTT
-      }
-
-      // 2. Hapus epoch_ms sebelum dikirim ke Supabase
-      lineDoc.remove("epoch_ms");
-
-      // 3. Kirim ke Supabase
-      String requestBody;
-      serializeJson(lineDoc, requestBody);
-
-      if (http.begin(client, SUPABASE_URL)) {
-        http.addHeader("Content-Type", "application/json");
-        http.addHeader("apikey", SUPABASE_KEY);
-        http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
-        http.addHeader("Prefer", "return=minimal");
-
-        int httpResponseCode = http.POST(requestBody);
-        
-        if (httpResponseCode == 201) {
+        if (tbClient.publish("v1/devices/me/telemetry", hPayload.c_str())) {
           successCount++;
+          delay(50); // Kasih nafas untuk jaringan
         } else {
           failCount++;
-          rewriteData += line + "\n"; // Kembalikan data original (termasuk epoch_ms) ke antrian
-          Serial.printf("[Supabase] Error %d: %s\n", httpResponseCode, http.getString().c_str());
+          rewriteData += line + "\n"; // Kembalikan ke memori jika gagal kirim
         }
-        http.end();
       } else {
         failCount++;
         rewriteData += line + "\n";
@@ -167,10 +136,12 @@ void syncUnsentData() {
     }
   }
 
-  Serial.println("--- Hasil Sinkronisasi SPIFFS ---");
-  Serial.printf("Sukses : %d\n", successCount);
-  Serial.printf("Gagal  : %d\n", failCount);
-  Serial.println("---------------------------------");
+  if (successCount > 0 || failCount > 0) {
+    Serial.println("--- Hasil Sinkronisasi Offline ---");
+    Serial.printf("Sukses terkirim : %d\n", successCount);
+    Serial.printf("Gagal / Sisa    : %d\n", failCount);
+    Serial.println("----------------------------------");
+  }
 }
 
 // --- Pin MAX485 ---
@@ -682,21 +653,24 @@ void loop() {
     String aiRecom = "";
     showResult(prediction, hum, temp, n, p, k, ph, ec, aiLabel, aiRecom);
 
-    // --- Kirim Telemetri ke ThingsBoard via MQTT ---
-    if (tbClient.connected()) {
-      StaticJsonDocument<512> mqttDoc;
-      mqttDoc["humidity"]    = hum;
-      mqttDoc["temperature"] = temp;
-      mqttDoc["n"]           = n;
-      mqttDoc["p"]           = p;
-      mqttDoc["k"]           = k;
-      mqttDoc["ph"]          = ph;
-      mqttDoc["ec"]          = (int)ec;
-      mqttDoc["ai_label"]    = aiLabel;
-      mqttDoc["recommendation"] = aiRecom;
+    // --- Persiapkan Payload JSON Utama ---
+    StaticJsonDocument<512> doc;
+    doc["humidity"]    = hum;
+    doc["temperature"] = temp;
+    doc["n"]           = n;
+    doc["p"]           = p;
+    doc["k"]           = k;
+    doc["ph"]          = ph;
+    doc["ec"]          = (int)ec;
+    doc["ai_label"]    = aiLabel;
+    doc["recommendation"] = aiRecom;
 
+    bool sentOnline = false;
+
+    // --- 1. Coba Kirim Telemetri ke ThingsBoard via MQTT ---
+    if (tbClient.connected()) {
       String mqttPayload;
-      serializeJson(mqttDoc, mqttPayload);
+      serializeJson(doc, mqttPayload);
 
       unsigned long start_mqtt = millis();
       bool success = tbClient.publish("v1/devices/me/telemetry", mqttPayload.c_str());
@@ -704,53 +678,30 @@ void loop() {
 
       if (success) {
         Serial.printf("[MQTT] Data terkirim ke ThingsBoard. (Latensi: %lu ms)\n", (end_mqtt - start_mqtt));
+        sentOnline = true;
+        
+        // Coba sinkronisasi sisa data offline (jika ada) karena koneksi bagus
+        syncUnsentData();
       } else {
         Serial.println("[MQTT] Gagal kirim ke ThingsBoard.");
       }
     } else {
-      Serial.println("[MQTT] Tidak terhubung ke ThingsBoard, skip.");
+      Serial.println("[MQTT] Tidak terhubung ke ThingsBoard.");
     }
 
-    // --- Send to Supabase (Tiap 1 Menit) ---
-    if (millis() - lastSupabaseUpdate >= SUPABASE_INTERVAL || lastSupabaseUpdate == 0) {
-      lastSupabaseUpdate = millis();
-      
-      // 1. Buat JSON Object untuk data saat ini
-      StaticJsonDocument<512> doc;
-      doc["Hum"]  = hum;
-      doc["Temp"] = temp;
-      doc["N"]    = n;
-      doc["P"]    = p;
-      doc["K"]    = k;
-      doc["pH"]   = ph;
-      doc["EC"]   = (int)ec;
-      doc["ai_label"] = aiLabel;
-      doc["recommendation"] = aiRecom;
-
-      // Sisipkan timestamp JIKA jam sudah valid (sudah pernah konek WiFi/NTP)
+    // --- 2. Jika Gagal Kirim Online (Offline), Simpan ke Memori SPIFFS ---
+    if (!sentOnline) {
+      // Sisipkan jam JIKA sudah punya jam yang valid dari NTP
       time_t now;
       time(&now);
       if (now > 1600000000) {
-        struct tm timeinfo;
-        localtime_r(&now, &timeinfo);
-        char timeStr[25];
-        strftime(timeStr, sizeof(timeStr), "%Y-%m-%dT%H:%M:%S", &timeinfo);
-        doc["timestamp"] = timeStr;
-        doc["epoch_ms"]  = (unsigned long long)now * 1000ULL; // untuk MQTT
+        doc["epoch_ms"]  = (unsigned long long)now * 1000ULL;
       }
       
       String currentData;
       serializeJson(doc, currentData);
-
-      // 2. Simpan ke Memori Lokal (SPIFFS) terlebih dahulu
       saveDataLocally(currentData);
-
-      // 3. Jika WiFi terkoneksi, coba kirim SEMUA isi SPIFFS
-      if (WiFi.status() == WL_CONNECTED) {
-        syncUnsentData();
-      } else {
-        Serial.println("[Wi-Fi] Offline! Data ditampung aman di SPIFFS.");
-      }
+      Serial.println("[Offline] Data aman, ditampung sementara di memori SPIFFS.");
     }
 
   } else {
