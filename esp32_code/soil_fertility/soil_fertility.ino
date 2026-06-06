@@ -1,9 +1,9 @@
 /**
  * ============================================================
- * Soil Fertility Classification & Prediction System  v2.0
+ * Soil Fertility Classification & Prediction System  v3.0
  * ============================================================
  * Hardware       : ESP32, MAX485, LCD I2C 16x4, Sensor NPK 7-in-1
- * AI Model       : Random Forest (Tuned) - micromlgen
+ * AI Model       : Random Forest (Tuned, 5 Kelas) - micromlgen
  * Wiring MAX485  : DI(17), RO(16), DE(4), RE(5)
  * Wiring LCD     : SDA(21), SCL(22)
  * ============================================================
@@ -23,76 +23,155 @@
  * ============================================================
  */
 
-#include "model.h"               // File model AI
+#include "rf_model.h"             // File model AI (5 kelas: Sangat Rendah-Sangat Tinggi)
 #include <Wire.h>                // I2C
 #include <LiquidCrystal_I2C.h>   // LCD I2C
 #include <WiFi.h>                // WiFi Library
 #include <HTTPClient.h>          // HTTP Client
 #include <WiFiClientSecure.h>    // HTTPS
-#include <ArduinoJson.h>         // JSON for Supabase
+#include <ArduinoJson.h>         // JSON for Supabase & ThingsBoard
+#include <PubSubClient.h>        // MQTT for ThingsBoard
 #include <time.h>                // NTP Time Sync
 #include <sntp.h>
-
-#define MAX_OFFLINE_RECORDS 60
-
-struct SensorRecord {
-  float hum;
-  float temp;
-  float n;
-  float p;
-  float k;
-  float ph;
-  float ec;
-  float oc;
-  char label[20];
-  char recom[150];
-  time_t timestamp;
-};
-
-SensorRecord offlineBuffer[MAX_OFFLINE_RECORDS];
-int offlineCount = 0;
-
-void addRecord(float hum, float temp, float n, float p, float k, float ph, float ec, float oc, const String &label, const String &recom) {
-  time_t now;
-  time(&now);
-  
-  if (offlineCount >= MAX_OFFLINE_RECORDS) {
-    // Geser array ke kiri untuk membuang data tertua
-    for (int i = 1; i < MAX_OFFLINE_RECORDS; i++) {
-      offlineBuffer[i - 1] = offlineBuffer[i];
-    }
-    offlineCount = MAX_OFFLINE_RECORDS - 1;
-  }
-  
-  offlineBuffer[offlineCount].hum = hum;
-  offlineBuffer[offlineCount].temp = temp;
-  offlineBuffer[offlineCount].n = n;
-  offlineBuffer[offlineCount].p = p;
-  offlineBuffer[offlineCount].k = k;
-  offlineBuffer[offlineCount].ph = ph;
-  offlineBuffer[offlineCount].ec = ec;
-  offlineBuffer[offlineCount].oc = oc;
-  
-  strncpy(offlineBuffer[offlineCount].label, label.c_str(), sizeof(offlineBuffer[offlineCount].label) - 1);
-  offlineBuffer[offlineCount].label[sizeof(offlineBuffer[offlineCount].label) - 1] = '\0';
-  
-  strncpy(offlineBuffer[offlineCount].recom, recom.c_str(), sizeof(offlineBuffer[offlineCount].recom) - 1);
-  offlineBuffer[offlineCount].recom[sizeof(offlineBuffer[offlineCount].recom) - 1] = '\0';
-  
-  offlineBuffer[offlineCount].timestamp = now;
-  offlineCount++;
-}
+#include <SPIFFS.h>              // Persistent Offline Storage
 
 // --- WiFi Configuration ---
-const char* WIFI_SSID = "punyaraden";
-const char* WIFI_PASS = "gakgratis";
+const char* WIFI_SSID = "Itsme";
+const char* WIFI_PASS = "1234567899";
 
 // --- Supabase Configuration ---
 const char* SUPABASE_URL = "https://zngqajfkegxhwwjoocka.supabase.co/rest/v1/soil_measurements";
 const char* SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpuZ3FhamZrZWd4aHd3am9vY2thIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg2NjQwODUsImV4cCI6MjA5NDI0MDA4NX0.ShtqLC3CIxx2m3TVNbcZX5VftLFLbJCSkZAfr8wCNrE";
 
 unsigned long lastSupabaseUpdate = 0;
-const unsigned long SUPABASE_INTERVAL = 60000; // 60 detik (kirim terus)
+const unsigned long SUPABASE_INTERVAL = 60000; // 60 detik
+
+// ============================
+// THINGSBOARD CONFIG
+// ============================
+const char* TB_SERVER = "eu.thingsboard.cloud";  // Ganti dengan IP/domain ThingsBoard
+const int   TB_PORT   = 1883;
+const char* TB_TOKEN  = "4ossQPvhJirMfLB0NYVR";  // Access Token device
+
+WiFiClient   espClient;
+PubSubClient tbClient(espClient);
+
+// FUNGSI UNTUK MENYIMPAN KE SPIFFS
+void saveDataLocally(String data) {
+  File file = SPIFFS.open("/unsent.txt", FILE_APPEND);
+  if (file) {
+    file.println(data);
+    file.close();
+  } else {
+    Serial.println("[SPIFFS] Gagal membuka file untuk menulis.");
+  }
+}
+
+// FUNGSI UNTUK MENGIRIM DATA TERSIMPAN (Satu per satu agar aman dari Error 400 Keys Mismatch)
+void syncUnsentData() {
+  if (!SPIFFS.exists("/unsent.txt")) return;
+
+  File file = SPIFFS.open("/unsent.txt", FILE_READ);
+  if (!file || file.size() == 0) {
+    if (file) file.close();
+    SPIFFS.remove("/unsent.txt");
+    return;
+  }
+
+  Serial.println("[Sync] Membaca data offline dari SPIFFS...");
+  String allData = "";
+  while (file.available()) {
+    allData += file.readStringUntil('\n') + "\n";
+  }
+  file.close();
+  
+  SPIFFS.remove("/unsent.txt"); // Hapus file lama, nanti ditulis ulang kalau ada yang gagal
+
+  int pos = 0;
+  int successCount = 0;
+  int failCount = 0;
+  String rewriteData = "";
+  
+  WiFiClientSecure client;
+  client.setInsecure(); // Bypass SSL verification
+  HTTPClient http;
+
+  while (pos < allData.length()) {
+    int endLine = allData.indexOf('\n', pos);
+    if (endLine == -1) break;
+    String line = allData.substring(pos, endLine);
+    pos = endLine + 1;
+    line.trim();
+    if (line.length() == 0) continue;
+
+    StaticJsonDocument<512> lineDoc;
+    DeserializationError err = deserializeJson(lineDoc, line);
+    if (!err) {
+      // 1. Kirim historis ke MQTT jika ada epoch_ms
+      if (tbClient.connected() && lineDoc.containsKey("epoch_ms")) {
+        StaticJsonDocument<512> hDoc;
+        hDoc["ts"] = lineDoc["epoch_ms"];
+        JsonObject vals = hDoc.createNestedObject("values");
+        vals["humidity"]    = lineDoc["Hum"];
+        vals["temperature"] = lineDoc["Temp"];
+        vals["n"]           = lineDoc["N"];
+        vals["p"]           = lineDoc["P"];
+        vals["k"]           = lineDoc["K"];
+        vals["ph"]          = lineDoc["pH"];
+        vals["ec"]          = lineDoc["EC"];
+        vals["ai_label"]    = lineDoc["ai_label"];
+        vals["recommendation"] = lineDoc["recommendation"];
+        
+        String hPayload;
+        serializeJson(hDoc, hPayload);
+        tbClient.publish("v1/devices/me/telemetry", hPayload.c_str());
+        delay(30); // Kasih nafas untuk MQTT
+      }
+
+      // 2. Hapus epoch_ms sebelum dikirim ke Supabase
+      lineDoc.remove("epoch_ms");
+
+      // 3. Kirim ke Supabase
+      String requestBody;
+      serializeJson(lineDoc, requestBody);
+
+      if (http.begin(client, SUPABASE_URL)) {
+        http.addHeader("Content-Type", "application/json");
+        http.addHeader("apikey", SUPABASE_KEY);
+        http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
+        http.addHeader("Prefer", "return=minimal");
+
+        int httpResponseCode = http.POST(requestBody);
+        
+        if (httpResponseCode == 201) {
+          successCount++;
+        } else {
+          failCount++;
+          rewriteData += line + "\n"; // Kembalikan data original (termasuk epoch_ms) ke antrian
+          Serial.printf("[Supabase] Error %d: %s\n", httpResponseCode, http.getString().c_str());
+        }
+        http.end();
+      } else {
+        failCount++;
+        rewriteData += line + "\n";
+      }
+    }
+  }
+
+  // Tulis ulang data yang gagal dikirim
+  if (rewriteData.length() > 0) {
+    File rewriteFile = SPIFFS.open("/unsent.txt", FILE_WRITE);
+    if (rewriteFile) {
+      rewriteFile.print(rewriteData);
+      rewriteFile.close();
+    }
+  }
+
+  Serial.println("--- Hasil Sinkronisasi SPIFFS ---");
+  Serial.printf("Sukses : %d\n", successCount);
+  Serial.printf("Gagal  : %d\n", failCount);
+  Serial.println("---------------------------------");
+}
 
 // --- Pin MAX485 ---
 #define DE_PIN  4
@@ -152,38 +231,23 @@ byte iconThermo[8] = {
 #define ICON_LEAF   1
 #define ICON_THERMO 2
 
-// --- Scaler & Profil Ideal (sesuai model AI) ---
-// TODO: Setelah retrain dengan data sensor, update MEAN & SCALE dari
-//       src/processed_data/scaler_params.csv yang baru.
-const float MEAN[6]  = {146.77f, 11.00f, 557.63f, 7.07f, 0.60f, 0.69f};
-const float SCALE[6] = { 51.48f,  4.17f, 187.76f, 0.66f, 0.24f, 0.31f};
-
-// Profil ideal — diselaraskan dengan range sensor NPK 7-in-1
-// Dipakai untuk rekomendasi pupuk (bukan untuk prediksi model)
-const float IDEAL[6] = {200.0f, 300.0f, 500.0f, 6.8f, 700.0f, 0.80f};
-
-// --- Koefisien Estimasi OC (Pedotransfer C/N + pH) ---
-// Sumber: regresi dari dataset1.csv (src/oc_estimator.py)
-// Formula: OC = OC_A0 + OC_AN*(N/10000) + OC_APH*(7.0-pH)
-const float OC_A0   =  0.550886f; // intercept
-const float OC_AN   =  3.405174f; // koef N  (input dalam persen: N_mg/10000)
-const float OC_APH  =  0.033136f; // koef (7 - pH)
-const float OC_CMIN =  0.1000f;   // batas bawah clamp
-const float OC_CMAX =  3.0000f;   // batas atas clamp (wajar untuk lahan mineral)
+// --- Profil Ideal — dipakai untuk rekomendasi pupuk (bukan prediksi model) ---
+// Model baru (rf_model.h) menggunakan raw features tanpa StandardScaler
+// Features: N, P, K, pH, EC (5 fitur)
+const float IDEAL_N  = 200.0f;   // mg/kg
+const float IDEAL_P  = 300.0f;   // mg/kg
+const float IDEAL_K  = 500.0f;   // mg/kg
+const float IDEAL_PH = 6.8f;     // pH optimal
+const float IDEAL_EC = 700.0f;   // us/cm
 
 #define IDX_N  0
 #define IDX_P  1
 #define IDX_K  2
 #define IDX_PH 3
 #define IDX_EC 4
-#define IDX_OC 5
 
 Eloquent::ML::Port::RandomForest classifier;
-
-// ---- Standard scaling ----
-float scaleFeature(float value, int idx) {
-  return (value - MEAN[idx]) / SCALE[idx];
-}
+// Model rf_model.h menggunakan raw values (tanpa StandardScaler)
 
 // ============================================================
 //  LCD HELPER FUNCTIONS
@@ -227,7 +291,7 @@ void splashScreen() {
   lcd.clear();
 
   // Baris 0: leaf + judul
-  lcdCenter(0, "  Soil AI v2.0  ");
+  lcdCenter(0, "  Soil AI v3.0  ");
   lcdIcon(2, 0, ICON_LEAF);
   lcdIcon(17, 0, ICON_LEAF);
 
@@ -265,7 +329,7 @@ void splashScreen() {
 void showResult(int pred,
                 float hum, float temp,
                 float n,   float p, float k,
-                float ph,  float ec, float oc,
+                float ph,  float ec,
                 String &outLabel, String &outRecom) {
   char r[21];   // buffer baris LCD (20 char + null)
 
@@ -283,35 +347,32 @@ void showResult(int pred,
   Serial.printf(" K  : %6.0f mg/kg\n", k);
   Serial.printf(" pH : %6.1f\n",        ph);
   Serial.printf(" EC : %6d us/cm\n",    (int)ec);
-  Serial.printf(" OC : %6.2f %%  (est)\n", oc);
   Serial.println("====================================");
 
-
   // ========================================================
-  // HALAMAN 1 — Data Sensor (5 detik)
+  // HALAMAN 1 — Data Sensor (10 detik)
   //
   //   Baris 0: "💧XX.X%  🌡XX.XC "  ← Hum + Suhu + ikon
   //   Baris 1: "N:XXX P:XX K:XXX "  ← NPK
   //   Baris 2: "pH:X.XX  EC:XXXX "  ← pH + EC
-  //   Baris 3: "OC est:  X.XX %  "  ← OC estimasi
+  //   Baris 3: kosong
   // ========================================================
   lcd.clear();
 
   // -- Baris 0: Kelembaban & Suhu --
   lcd.setCursor(0, 0);
-  lcd.write(byte(ICON_DROP));                 // 💧 col 0
+  lcd.write(byte(ICON_DROP));
   snprintf(r, sizeof(r), " %.1f%%", hum);
   lcd.setCursor(1, 0);
   lcd.print(r);
 
   int nextCol = 1 + strlen(r);
-  // Isi spasi sampai col 11
   for (int i = nextCol; i < 11; i++) {
     lcd.setCursor(i, 0);
     lcd.print(" ");
   }
   lcd.setCursor(11, 0);
-  lcd.write(byte(ICON_THERMO));               // 🌡 col 11
+  lcd.write(byte(ICON_THERMO));
   snprintf(r, sizeof(r), " %.1fC", temp);
   lcd.setCursor(12, 0);
   lcd.print(r);
@@ -323,23 +384,23 @@ void showResult(int pred,
   snprintf(r, sizeof(r), "N:%-3d  P:%-3d  K:%-3d", ni, pi, ki);
   lcdPrint(1, r);
 
-  // -- Baris 2: pH dan EC --
+  // -- Baris 3: pH dan EC --
   snprintf(r, sizeof(r), "pH: %.1f   EC: %4d", ph, (int)ec);
   lcdPrint(2, r);
 
-  // -- Baris 3: OC estimasi --
-  snprintf(r, sizeof(r), "OC est:  %5.2f %%", oc);
-  lcdPrint(3, r);
+  // -- Baris 3: kosong / siap rekomendasi --
+  lcdPrint(3, "");
 
-  delay(10000); 
+  delay(10000);
 
   // ========================================================
-  // HALAMAN 2 — Hasil AI + Rekomendasi
+  // HALAMAN 2 — Hasil AI (5 Kelas) + Rekomendasi
   //
-  //   Baris 0: "==🌿 HASIL AI 🌿=="  ← header dekoratif
-  //   Baris 1: status kesuburan
-  //   Baris 2: "Rekomendasi:    "
-  //   Baris 3: isi rekomendasi (cycling tiap 2.5 detik)
+  //   Kelas 0: Sangat Rendah
+  //   Kelas 1: Rendah
+  //   Kelas 2: Sedang
+  //   Kelas 3: Tinggi
+  //   Kelas 4: Sangat Tinggi
   // ========================================================
   lcd.clear();
 
@@ -350,57 +411,83 @@ void showResult(int pred,
 
   outRecom = "";
 
-  if (pred == 2) {
-    // ---- SANGAT SUBUR ----
-    outLabel = "Sangat Subur";
-    outRecom = "Pertahankan kondisi saat ini.";
+  // ---- Tampilkan label kesuburan di Baris 1 ----
+  // LCD 20x4: lcdCenter otomatis menghitung padding
+  // "SANGAT RENDAH" (13 chr) -> pad=3, teks col 3-15, icon di col 1 & 17
+  // "RENDAH"        ( 6 chr) -> pad=7, teks col 7-12, icon di col 5 & 14
+  // "SEDANG"        ( 6 chr) -> pad=7, teks col 7-12, icon di col 5 & 14
+  // "TINGGI"        ( 6 chr) -> pad=7, teks col 7-12, icon di col 5 & 14
+  // "SANGAT TINGGI" (13 chr) -> pad=3, teks col 3-15, icon di col 1 & 17
+  switch (pred) {
+    case 0:  // Sangat Rendah — pad=3, teks col 3-15
+      outLabel = "Sangat Rendah";
+      lcdCenter(1, "SANGAT RENDAH");
+      lcdIcon(1, 1, ICON_LEAF);
+      lcdIcon(17, 1, ICON_LEAF);
+      Serial.println(" Status: SANGAT RENDAH");
+      break;
+    case 1:  // Rendah — pad=7, teks col 7-12
+      outLabel = "Rendah";
+      lcdCenter(1, "RENDAH");
+      lcdIcon(5, 1, ICON_LEAF);
+      lcdIcon(14, 1, ICON_LEAF);
+      Serial.println(" Status: RENDAH");
+      break;
+    case 2:  // Sedang — pad=7, teks col 7-12
+      outLabel = "Sedang";
+      lcdCenter(1, "SEDANG");
+      lcdIcon(5, 1, ICON_LEAF);
+      lcdIcon(14, 1, ICON_LEAF);
+      Serial.println(" Status: SEDANG");
+      break;
+    case 3:  // Tinggi — pad=7, teks col 7-12
+      outLabel = "Tinggi";
+      lcdCenter(1, "TINGGI");
+      lcdIcon(5, 1, ICON_LEAF);
+      lcdIcon(14, 1, ICON_LEAF);
+      Serial.println(" Status: TINGGI");
+      break;
+    case 4:  // Sangat Tinggi — pad=3, teks col 3-15
+      outLabel = "Sangat Tinggi";
+      lcdCenter(1, "SANGAT TINGGI");
+      lcdIcon(1, 1, ICON_LEAF);
+      lcdIcon(17, 1, ICON_LEAF);
+      Serial.println(" Status: SANGAT TINGGI");
+      break;
+    default:
+      outLabel = "Unknown";
+      lcdCenter(1, "UNKNOWN");
+      Serial.println(" Status: UNKNOWN");
+      break;
+  }
 
-    lcdCenter(1, "  SANGAT SUBUR  ");
-    lcdIcon(2, 1, ICON_LEAF);
-    lcdIcon(17, 1, ICON_LEAF);
+  lcdPrint(2, "Rekomendasi:        ");
+  lcdPrint(3, "                    ");
+  delay(500);
 
-    lcdCenter(2, "Status: Optimal");
-    lcdCenter(3, "Pertahankan!");
+  bool hasRecom = false;
 
-    Serial.println(" Status  : SANGAT SUBUR");
+  // ---- Rekomendasi Kelas 4 (Sangat Tinggi) ----
+  if (pred == 4) {
+    outRecom = "Pertahankan, kurangi pupuk kimia.";
+    showRecom("Pertahankan!    ");
     Serial.println(" Tindakan: Pertahankan kondisi saat ini.");
     delay(1000);
-
   } else {
-    // ---- SUBUR atau KURANG SUBUR ----
-    if (pred == 1) {
-      outLabel = "Subur";
-      lcdCenter(1, "     SUBUR      ");
-      lcdIcon(3, 1, ICON_LEAF);
-      lcdIcon(16, 1, ICON_LEAF);
-      Serial.println(" Status: SUBUR");
-    } else {
-      outLabel = "Kurang Subur";
-      lcdCenter(1, "  KURANG SUBUR  ");
-      lcdIcon(1, 1, ICON_LEAF);
-      lcdIcon(18, 1, ICON_LEAF);
-      Serial.println(" Status: KURANG SUBUR");
-    }
-
-    lcdPrint(2, "Rekomendasi:        ");
-    lcdPrint(3, "                    ");
-    delay(500);
-
-    bool hasRecom = false;
-
-    if (n < IDEAL[IDX_N] * 0.8f) {
+    // ---- Rekomendasi berbasis defisiensi nutrisi ----
+    if (n < IDEAL_N * 0.8f) {
       Serial.printf(" - N Rendah (%.0f mg/kg) -> Tambah Urea\n", n);
       showRecom("+Urea / Kompos  ");
       outRecom += "Tambah Urea, ";
       hasRecom = true;
     }
-    if (p < IDEAL[IDX_P] * 0.8f) {
+    if (p < IDEAL_P * 0.8f) {
       Serial.printf(" - P Rendah (%.0f mg/kg) -> Tambah SP-36\n", p);
       showRecom("+SP-36/Rock Phos");
       outRecom += "Tambah SP-36, ";
       hasRecom = true;
     }
-    if (k < IDEAL[IDX_K] * 0.8f) {
+    if (k < IDEAL_K * 0.8f) {
       Serial.printf(" - K Rendah (%.0f mg/kg) -> Tambah KCl\n", k);
       showRecom("+KCl / Abu Kayu ");
       outRecom += "Tambah KCl, ";
@@ -417,13 +504,6 @@ void showResult(int pred,
       outRecom += "Tambah Belerang, ";
       hasRecom = true;
     }
-    if (oc < 0.5f) {
-      Serial.println(" - C-Organik Rendah -> Tambah Pupuk Kandang");
-      showRecom("+Pupuk Kandang  ");
-      outRecom += "Tambah Pupuk Kandang, ";
-      hasRecom = true;
-    }
-
     if (!hasRecom) {
       showRecom("  Kondisi Baik! ");
       outRecom = "Kondisi Baik!";
@@ -436,6 +516,23 @@ void showResult(int pred,
 }
 
 // ============================================================
+//  THINGSBOARD MQTT — Reconnect jika putus
+// ============================================================
+void tbReconnect() {
+  int retries = 0;
+  while (!tbClient.connected() && retries < 3) {
+    Serial.print("[MQTT] Connecting to ThingsBoard...");
+    if (tbClient.connect("ESP32_Soil_AI", TB_TOKEN, NULL)) {
+      Serial.println(" CONNECTED!");
+    } else {
+      Serial.printf(" FAILED (rc=%d), retry %d/3\n", tbClient.state(), retries + 1);
+      retries++;
+      delay(2000);
+    }
+  }
+}
+
+// ============================================================
 void setup() {
   Serial.begin(115200);
   Serial2.begin(4800, SERIAL_8N1, RX2_PIN, TX2_PIN);
@@ -444,6 +541,13 @@ void setup() {
   pinMode(RE_PIN, OUTPUT);
   digitalWrite(DE_PIN, LOW);
   digitalWrite(RE_PIN, LOW);
+
+  // --- Inisialisasi SPIFFS ---
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS Mount Failed! Data offline tidak bisa disimpan.");
+  } else {
+    Serial.println("SPIFFS OK.");
+  }
 
   // --- Inisialisasi LCD + custom characters ---
   lcd.begin();
@@ -469,7 +573,11 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED) {
     lcdPrint(2, "WiFi Terhubung!");
     Serial.println("\nWiFi Connected!");
+    tbClient.setServer(TB_SERVER, TB_PORT);  // Setup MQTT ThingsBoard
     configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov"); // Sync jam ke WIB (UTC+7)
+    
+    // Sync data yang tertahan selama alat mati
+    syncUnsentData();
   } else {
     lcdPrint(2, "Gagal Konek WiFi");
     Serial.println("\nWiFi Failed!");
@@ -478,13 +586,20 @@ void setup() {
   lcd.clear();
 
   Serial.println("============================================");
-  Serial.println("  Soil AI System v2.0 - Smart Farming");
+  Serial.println("  Soil AI System v3.0 - Smart Farming");
+  Serial.println("  Model: RF 5 Kelas (Sangat Rendah - Sangat Tinggi)");
   Serial.println("============================================");
   Serial.println("Sistem Prediksi Tanah AI Siap!\n");
 }
 
 // ============================================================
 void loop() {
+  // --- MQTT KEEPALIVE ThingsBoard ---
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!tbClient.connected()) tbReconnect();
+    tbClient.loop(); // wajib ada agar koneksi MQTT tidak timeout
+  }
+
   // 1. Kirim request Modbus ke sensor
   digitalWrite(DE_PIN, HIGH);
   digitalWrite(RE_PIN, HIGH);
@@ -513,100 +628,128 @@ void loop() {
     float n    = (float)(values[11] << 8 | values[12]);
     float p    = (float)(values[13] << 8 | values[14]);
     float k    = (float)(values[15] << 8 | values[16]);
-    // Estimasi OC via Pedotransfer Function (C/N ratio + faktor pH)
-    // OC(%) = a0 + a_N*(N%/100) + a_pH*(7-pH)  — difit dari dataset1.csv
-    float n_pct = n / 10000.0f;                        // mg/kg -> persen
-    float oc    = OC_A0 + OC_AN * n_pct + OC_APH * (7.0f - ph);
-    oc = constrain(oc, OC_CMIN, OC_CMAX);              // clamp ke rentang wajar
 
-    float features[6];
-    features[IDX_N]  = scaleFeature(n,  IDX_N);
-    features[IDX_P]  = scaleFeature(p,  IDX_P);
-    features[IDX_K]  = scaleFeature(k,  IDX_K);
-    features[IDX_PH] = scaleFeature(ph, IDX_PH);
-    features[IDX_EC] = scaleFeature(ec, IDX_EC);
-    features[IDX_OC] = scaleFeature(oc, IDX_OC);
+    // --- Sanity Check: N=0, P=0, K=0, EC=0 → sensor belum baca / tidak valid ---
+    // Nilai NPK dan EC semuanya 0 tidak mungkin terjadi di tanah nyata.
+    // Biasanya terjadi di pembacaan pertama atau saat koneksi RS485 belum stabil.
+    if (n == 0 && p == 0 && k == 0 && ec == 0) {
+      Serial.printf("[WARN] Data tidak valid — N:%.0f P:%.0f K:%.0f EC:%.0f pH:%.1f | Skip AI.\n",
+                    n, p, k, ec, ph);
+
+      lcd.clear();
+
+      // Baris 0: "  [DROP] SENSOR ERROR [DROP]  "
+      // "SENSOR  ERROR" = 13 char → pad=3 (col 3-15), ikon di col 1 & 18
+      lcdCenter(0, "SENSOR  ERROR");
+      lcdIcon(1, 0, ICON_DROP);
+      lcdIcon(18, 0, ICON_DROP);
+
+      // Baris 1: status singkat
+      // "Data Tidak Valid" = 16 char → pad=2
+      lcdCenter(1, "Data Tidak Valid");
+
+      // Baris 2: nilai yang bermasalah
+      // "N=P=K=EC = 0" = 13 char → pad=3
+      lcdCenter(2, "N=P=K=EC = 0");
+
+      // Baris 3: countdown animasi 3 detik
+      for (int c = 3; c > 0; c--) {
+        char cbuf[21];
+        // "Coba ulang: 3 detik" = 19 char → pad=0
+        snprintf(cbuf, sizeof(cbuf), "Coba ulang: %d detik", c);
+        lcdCenter(3, cbuf);
+        delay(1000);
+      }
+      return; // skip prediksi & pengiriman data
+    }
+
+    // Model rf_model.h: 5 fitur RAW (tanpa scaling) — N, P, K, pH, EC
+    float features[5];
+    features[IDX_N]  = n;
+    features[IDX_P]  = p;
+    features[IDX_K]  = k;
+    features[IDX_PH] = ph;
+    features[IDX_EC] = ec;
 
     unsigned long start_time = micros();
     int prediction = classifier.predict(features);
     unsigned long latency = micros() - start_time;
     float latency_sec = latency / 1000000.0f;
     Serial.printf("\n[AI Latency: %.6f seconds]\n", latency_sec);
+    Serial.printf("[AI Class: %d = %s]\n", prediction, classifier.idxToLabel(prediction));
 
     String aiLabel = "";
     String aiRecom = "";
-    showResult(prediction, hum, temp, n, p, k, ph, ec, oc, aiLabel, aiRecom);
+    showResult(prediction, hum, temp, n, p, k, ph, ec, aiLabel, aiRecom);
+
+    // --- Kirim Telemetri ke ThingsBoard via MQTT ---
+    if (tbClient.connected()) {
+      StaticJsonDocument<512> mqttDoc;
+      mqttDoc["humidity"]    = hum;
+      mqttDoc["temperature"] = temp;
+      mqttDoc["n"]           = n;
+      mqttDoc["p"]           = p;
+      mqttDoc["k"]           = k;
+      mqttDoc["ph"]          = ph;
+      mqttDoc["ec"]          = (int)ec;
+      mqttDoc["ai_label"]    = aiLabel;
+      mqttDoc["recommendation"] = aiRecom;
+
+      String mqttPayload;
+      serializeJson(mqttDoc, mqttPayload);
+
+      unsigned long start_mqtt = millis();
+      bool success = tbClient.publish("v1/devices/me/telemetry", mqttPayload.c_str());
+      unsigned long end_mqtt = millis();
+
+      if (success) {
+        Serial.printf("[MQTT] Data terkirim ke ThingsBoard. (Latensi: %lu ms)\n", (end_mqtt - start_mqtt));
+      } else {
+        Serial.println("[MQTT] Gagal kirim ke ThingsBoard.");
+      }
+    } else {
+      Serial.println("[MQTT] Tidak terhubung ke ThingsBoard, skip.");
+    }
 
     // --- Send to Supabase (Tiap 1 Menit) ---
     if (millis() - lastSupabaseUpdate >= SUPABASE_INTERVAL || lastSupabaseUpdate == 0) {
       lastSupabaseUpdate = millis();
       
-      // 1. Simpan data terbaru ke buffer
-      addRecord(hum, temp, n, p, k, ph, ec, oc, aiLabel, aiRecom);
+      // 1. Buat JSON Object untuk data saat ini
+      StaticJsonDocument<512> doc;
+      doc["Hum"]  = hum;
+      doc["Temp"] = temp;
+      doc["N"]    = n;
+      doc["P"]    = p;
+      doc["K"]    = k;
+      doc["pH"]   = ph;
+      doc["EC"]   = (int)ec;
+      doc["ai_label"] = aiLabel;
+      doc["recommendation"] = aiRecom;
 
-      // 2. Cek koneksi Wi-Fi
-      if (WiFi.status() != WL_CONNECTED) {
-        Serial.printf("[Wi-Fi] Offline! Data ditampung (Buffer: %d/%d)\n", offlineCount, MAX_OFFLINE_RECORDS);
-        WiFi.reconnect(); // Coba sambung ulang secara background
+      // Sisipkan timestamp JIKA jam sudah valid (sudah pernah konek WiFi/NTP)
+      time_t now;
+      time(&now);
+      if (now > 1600000000) {
+        struct tm timeinfo;
+        localtime_r(&now, &timeinfo);
+        char timeStr[25];
+        strftime(timeStr, sizeof(timeStr), "%Y-%m-%dT%H:%M:%S", &timeinfo);
+        doc["timestamp"] = timeStr;
+        doc["epoch_ms"]  = (unsigned long long)now * 1000ULL; // untuk MQTT
+      }
+      
+      String currentData;
+      serializeJson(doc, currentData);
+
+      // 2. Simpan ke Memori Lokal (SPIFFS) terlebih dahulu
+      saveDataLocally(currentData);
+
+      // 3. Jika WiFi terkoneksi, coba kirim SEMUA isi SPIFFS
+      if (WiFi.status() == WL_CONNECTED) {
+        syncUnsentData();
       } else {
-        Serial.printf("[Supabase] Mengirim %d data tersimpan...\n", offlineCount);
-        
-        WiFiClientSecure client;
-        client.setInsecure(); // Bypass SSL verification
-        HTTPClient http;
-        
-        if (http.begin(client, SUPABASE_URL)) {
-          http.addHeader("Content-Type", "application/json");
-          http.addHeader("apikey", SUPABASE_KEY);
-          String authHeader = String("Bearer ") + SUPABASE_KEY;
-          http.addHeader("Authorization", authHeader.c_str());
-          http.addHeader("Prefer", "return=minimal");
-
-          // Buat array JSON dinamis (maksimal sekitar 24KB memori heap untuk 60 data + string teks)
-          DynamicJsonDocument doc(24000);
-          JsonArray array = doc.to<JsonArray>();
-          
-          for (int i = 0; i < offlineCount; i++) {
-            JsonObject obj = array.createNestedObject();
-            obj["Hum"] = offlineBuffer[i].hum;
-            obj["Temp"] = offlineBuffer[i].temp;
-            obj["N"] = offlineBuffer[i].n;
-            obj["P"] = offlineBuffer[i].p;
-            obj["K"] = offlineBuffer[i].k;
-            obj["pH"] = offlineBuffer[i].ph;
-            obj["EC"] = (int)offlineBuffer[i].ec;
-            obj["OC_est"] = offlineBuffer[i].oc;
-            obj["ai_label"] = offlineBuffer[i].label;
-            obj["recommendation"] = offlineBuffer[i].recom;
-            
-            // Sertakan timestamp HANYA JIKA jam sudah pernah tersinkron (NTP berhasil)
-            if (offlineBuffer[i].timestamp > 1600000000) {
-              struct tm timeinfo;
-              localtime_r(&offlineBuffer[i].timestamp, &timeinfo);
-              char timeStr[25];
-              strftime(timeStr, sizeof(timeStr), "%Y-%m-%dT%H:%M:%S", &timeinfo);
-              obj["timestamp"] = timeStr;
-            }
-          }
-
-          String requestBody;
-          serializeJson(doc, requestBody);
-
-          int httpResponseCode = http.POST(requestBody);
-          
-          if (httpResponseCode == 201) {
-            Serial.println("[Supabase] Berhasil mengirim bulk data! Buffer dibersihkan.");
-            offlineCount = 0; // Bersihkan buffer setelah data terkirim sukses
-          } else {
-            Serial.printf("[Supabase] Error code: %d. Data tetap disimpan di buffer.\n", httpResponseCode);
-            if (httpResponseCode < 0) {
-              Serial.println(http.errorToString(httpResponseCode).c_str());
-            }
-          }
-          http.end();
-        } else {
-           Serial.println("[Supabase] Gagal inisialisasi HTTP.");
-        }
+        Serial.println("[Wi-Fi] Offline! Data ditampung aman di SPIFFS.");
       }
     }
 
