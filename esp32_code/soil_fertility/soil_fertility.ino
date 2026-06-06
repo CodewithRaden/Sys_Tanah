@@ -565,6 +565,17 @@ void setup() {
 
 // ============================================================
 void loop() {
+  // --- WIFI AUTO-RECONNECT (Non-Blocking) ---
+  if (WiFi.status() != WL_CONNECTED) {
+    static unsigned long lastWiFiCheck = 0;
+    if (millis() - lastWiFiCheck >= 10000) { // Coba konek ulang tiap 10 detik
+      Serial.println("[Wi-Fi] Terputus! Mencoba menyambung kembali...");
+      WiFi.disconnect();
+      WiFi.reconnect();
+      lastWiFiCheck = millis();
+    }
+  }
+
   // --- MQTT KEEPALIVE ThingsBoard ---
   if (WiFi.status() == WL_CONNECTED) {
     if (!tbClient.connected()) tbReconnect();
