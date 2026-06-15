@@ -23,61 +23,68 @@
  * ============================================================
  */
 
-#include "rf_model.h"             // File model AI (5 kelas: Sangat Rendah-Sangat Tinggi)
-#include <Wire.h>                // I2C
-#include <LiquidCrystal_I2C.h>   // LCD I2C
-#include <WiFi.h>                // WiFi Library
-#include <ArduinoJson.h>         // JSON for ThingsBoard
-#include <PubSubClient.h>        // MQTT for ThingsBoard
-#include <time.h>                // NTP Time Sync
+#include "rf_model_tuned.h"    // File model AI
+#include <Wire.h>              // I2C
+#include <LiquidCrystal_I2C.h> // LCD I2C
+#include <WiFi.h>              // WiFi Library
+#include <ArduinoJson.h>       // JSON for ThingsBoard
+#include <PubSubClient.h>      // MQTT for ThingsBoard
+#include <time.h>              // NTP Time Sync
 #include <sntp.h>
-#include <SPIFFS.h>              // Persistent Offline Storage
+#include <SPIFFS.h> // Persistent Offline Storage
 
 // --- WiFi Configuration ---
-const char* WIFI_SSID = "Itsme";
-const char* WIFI_PASS = "1234567899";
-
-// --- Konfigurasi Supabase dihapus: Kini diteruskan lewat ThingsBoard Rule Engine ---
+const char *WIFI_SSID = "Itsme";
+const char *WIFI_PASS = "1234567899";
 
 // ============================
 // THINGSBOARD CONFIG
 // ============================
-const char* TB_SERVER = "eu.thingsboard.cloud";  // Ganti dengan IP/domain ThingsBoard
-const int   TB_PORT   = 1883;
-const char* TB_TOKEN  = "4ossQPvhJirMfLB0NYVR";  // Access Token device
+const char *TB_SERVER = "eu.thingsboard.cloud"; // IP/domain ThingsBoard
+const int TB_PORT = 1883;
+const char *TB_TOKEN = "4ossQPvhJirMfLB0NYVR"; // Access Token
 
-WiFiClient   espClient;
+WiFiClient espClient;
 PubSubClient tbClient(espClient);
 
 // FUNGSI UNTUK MENYIMPAN KE SPIFFS
-void saveDataLocally(String data) {
+void saveDataLocally(String data)
+{
   File file = SPIFFS.open("/unsent.txt", FILE_APPEND);
-  if (file) {
+  if (file)
+  {
     file.println(data);
     file.close();
-  } else {
+  }
+  else
+  {
     Serial.println("[SPIFFS] Gagal membuka file untuk menulis.");
   }
 }
 
 // FUNGSI UNTUK MENGIRIM DATA TERSIMPAN VIA MQTT
-void syncUnsentData() {
-  if (!SPIFFS.exists("/unsent.txt")) return;
+void syncUnsentData()
+{
+  if (!SPIFFS.exists("/unsent.txt"))
+    return;
 
   File file = SPIFFS.open("/unsent.txt", FILE_READ);
-  if (!file || file.size() == 0) {
-    if (file) file.close();
+  if (!file || file.size() == 0)
+  {
+    if (file)
+      file.close();
     SPIFFS.remove("/unsent.txt");
     return;
   }
 
   Serial.println("[Sync] Membaca data offline dari SPIFFS...");
   String allData = "";
-  while (file.available()) {
+  while (file.available())
+  {
     allData += file.readStringUntil('\n') + "\n";
   }
   file.close();
-  
+
   SPIFFS.remove("/unsent.txt"); // Hapus file lama, nanti ditulis ulang kalau ada yang gagal
 
   int pos = 0;
@@ -85,42 +92,52 @@ void syncUnsentData() {
   int failCount = 0;
   String rewriteData = "";
 
-  while (pos < allData.length()) {
+  while (pos < allData.length())
+  {
     int endLine = allData.indexOf('\n', pos);
-    if (endLine == -1) break;
+    if (endLine == -1)
+      break;
     String line = allData.substring(pos, endLine);
     pos = endLine + 1;
     line.trim();
-    if (line.length() == 0) continue;
+    if (line.length() == 0)
+      continue;
 
     StaticJsonDocument<512> lineDoc;
     DeserializationError err = deserializeJson(lineDoc, line);
-    if (!err) {
-      if (tbClient.connected() && lineDoc.containsKey("epoch_ms")) {
+    if (!err)
+    {
+      if (tbClient.connected() && lineDoc.containsKey("epoch_ms"))
+      {
         StaticJsonDocument<512> hDoc;
         hDoc["ts"] = lineDoc["epoch_ms"];
         JsonObject vals = hDoc.createNestedObject("values");
-        // Karena di SPIFFS kita simpan pakai huruf kecil (sesuai keys MQTT), kita ambil huruf kecil:
-        vals["humidity"]    = lineDoc["humidity"];
+        vals["humidity"] = lineDoc["humidity"];
         vals["temperature"] = lineDoc["temperature"];
-        vals["n"]           = lineDoc["n"];
-        vals["p"]           = lineDoc["p"];
-        vals["k"]           = lineDoc["k"];
-        vals["ph"]          = lineDoc["ph"];
-        vals["ec"]          = lineDoc["ec"];
-        vals["ai_label"]    = lineDoc["ai_label"];
+        vals["n"] = lineDoc["n"];
+        vals["p"] = lineDoc["p"];
+        vals["k"] = lineDoc["k"];
+        vals["ph"] = lineDoc["ph"];
+        vals["ec"] = lineDoc["ec"];
+        vals["ai_label"] = lineDoc["ai_label"];
         vals["recommendation"] = lineDoc["recommendation"];
-        
+        vals["ts_iso"] = lineDoc["ts_iso"];
+
         String hPayload;
         serializeJson(hDoc, hPayload);
-        if (tbClient.publish("v1/devices/me/telemetry", hPayload.c_str())) {
+        if (tbClient.publish("v1/devices/me/telemetry", hPayload.c_str()))
+        {
           successCount++;
-          delay(50); // Kasih nafas untuk jaringan
-        } else {
+          delay(500); // Kasih waktu Rule Engine wakk untuk meneruskan data ke Supabase
+        }
+        else
+        {
           failCount++;
           rewriteData += line + "\n"; // Kembalikan ke memori jika gagal kirim
         }
-      } else {
+      }
+      else
+      {
         failCount++;
         rewriteData += line + "\n";
       }
@@ -128,15 +145,18 @@ void syncUnsentData() {
   }
 
   // Tulis ulang data yang gagal dikirim
-  if (rewriteData.length() > 0) {
+  if (rewriteData.length() > 0)
+  {
     File rewriteFile = SPIFFS.open("/unsent.txt", FILE_WRITE);
-    if (rewriteFile) {
+    if (rewriteFile)
+    {
       rewriteFile.print(rewriteData);
       rewriteFile.close();
     }
   }
 
-  if (successCount > 0 || failCount > 0) {
+  if (successCount > 0 || failCount > 0)
+  {
     Serial.println("--- Hasil Sinkronisasi Offline ---");
     Serial.printf("Sukses terkirim : %d\n", successCount);
     Serial.printf("Gagal / Sisa    : %d\n", failCount);
@@ -145,14 +165,14 @@ void syncUnsentData() {
 }
 
 // --- Pin MAX485 ---
-#define DE_PIN  4
-#define RE_PIN  5
+#define DE_PIN 4
+#define RE_PIN 5
 #define RX2_PIN 16
 #define TX2_PIN 17
 
 // --- Modbus request: baca 7 register mulai 0x0000 ---
 const byte soilQuery[] = {0x01, 0x03, 0x00, 0x00, 0x00, 0x07, 0x04, 0x08};
-byte values[19];  // 3 header + 14 data + 2 CRC
+byte values[19]; // 3 header + 14 data + 2 CRC
 
 // --- LCD 20x4 ---
 LiquidCrystal_I2C lcd(0x27, 20, 4);
@@ -163,86 +183,84 @@ LiquidCrystal_I2C lcd(0x27, 20, 4);
 
 // Slot 0: Water Droplet (kelembaban)
 byte iconDrop[8] = {
-  0b00100,
-  0b00100,
-  0b01110,
-  0b01110,
-  0b11111,
-  0b11111,
-  0b11111,
-  0b01110
-};
+    0b00100,
+    0b00100,
+    0b01110,
+    0b01110,
+    0b11111,
+    0b11111,
+    0b11111,
+    0b01110};
 
 // Slot 1: Leaf (kesuburan/tanaman)
 byte iconLeaf[8] = {
-  0b00010,
-  0b00110,
-  0b01110,
-  0b11110,
-  0b01111,
-  0b00111,
-  0b00110,
-  0b01100
-};
+    0b00010,
+    0b00110,
+    0b01110,
+    0b11110,
+    0b01111,
+    0b00111,
+    0b00110,
+    0b01100};
 
 // Slot 2: Thermometer (suhu)
 byte iconThermo[8] = {
-  0b00100,
-  0b01010,
-  0b01010,
-  0b01010,
-  0b01110,
-  0b11111,
-  0b11111,
-  0b01110
-};
+    0b00100,
+    0b01010,
+    0b01010,
+    0b01010,
+    0b01110,
+    0b11111,
+    0b11111,
+    0b01110};
 
 // Custom char index aliases
-#define ICON_DROP   0
-#define ICON_LEAF   1
+#define ICON_DROP 0
+#define ICON_LEAF 1
 #define ICON_THERMO 2
 
-// --- Profil Ideal — dipakai untuk rekomendasi pupuk (bukan prediksi model) ---
-// Model baru (rf_model.h) menggunakan raw features tanpa StandardScaler
 // Features: N, P, K, pH, EC (5 fitur)
-const float IDEAL_N  = 200.0f;   // mg/kg
-const float IDEAL_P  = 300.0f;   // mg/kg
-const float IDEAL_K  = 500.0f;   // mg/kg
-const float IDEAL_PH = 6.8f;     // pH optimal
-const float IDEAL_EC = 700.0f;   // us/cm
+const float IDEAL_N = 200.0f;  // mg/kg
+const float IDEAL_P = 300.0f;  // mg/kg
+const float IDEAL_K = 500.0f;  // mg/kg
+const float IDEAL_PH = 6.8f;   // pH optimal
+const float IDEAL_EC = 700.0f; // us/cm
 
-#define IDX_N  0
-#define IDX_P  1
-#define IDX_K  2
+#define IDX_N 0
+#define IDX_P 1
+#define IDX_K 2
 #define IDX_PH 3
 #define IDX_EC 4
 
 Eloquent::ML::Port::RandomForest classifier;
-// Model rf_model.h menggunakan raw values (tanpa StandardScaler)
 
 // ============================================================
 //  LCD HELPER FUNCTIONS
 // ============================================================
 
 // Bersihkan lalu tulis teks di baris tertentu
-void lcdPrint(uint8_t row, const char* text) {
+void lcdPrint(uint8_t row, const char *text)
+{
   lcd.setCursor(0, row);
-  lcd.print("                    ");   // bersihkan 20 kolom
+  lcd.print("                    ");
   lcd.setCursor(0, row);
   lcd.print(text);
 }
 
 // Tulis custom character di posisi tertentu
-void lcdIcon(uint8_t col, uint8_t row, uint8_t charIdx) {
+void lcdIcon(uint8_t col, uint8_t row, uint8_t charIdx)
+{
   lcd.setCursor(col, row);
   lcd.write(byte(charIdx));
 }
 
 // Tulis teks rata tengah di baris tertentu
-void lcdCenter(uint8_t row, const char* text) {
+void lcdCenter(uint8_t row, const char *text)
+{
   int len = strlen(text);
   int pad = (20 - len) / 2;
-  if (pad < 0) pad = 0;
+  if (pad < 0)
+    pad = 0;
   lcd.setCursor(0, row);
   lcd.print("                    ");
   lcd.setCursor(pad, row);
@@ -250,7 +268,8 @@ void lcdCenter(uint8_t row, const char* text) {
 }
 
 // Tampilkan rekomendasi cycling di baris 3
-void showRecom(const char* isi) {
+void showRecom(const char *isi)
+{
   lcdPrint(3, isi);
   delay(500);
 }
@@ -258,7 +277,8 @@ void showRecom(const char* isi) {
 // ============================================================
 //  SPLASH SCREEN — Animasi saat boot
 // ============================================================
-void splashScreen() {
+void splashScreen()
+{
   lcd.clear();
 
   // Baris 0: leaf + judul
@@ -276,9 +296,10 @@ void splashScreen() {
   lcd.print("[");
   lcd.setCursor(19, 3);
   lcd.print("]");
-  for (int i = 1; i <= 18; i++) {
+  for (int i = 1; i <= 18; i++)
+  {
     lcd.setCursor(i, 3);
-    lcd.write(0xFF);   // blok penuh bawaan LCD
+    lcd.write(0xFF);
     delay(90);
   }
 
@@ -299,10 +320,11 @@ void splashScreen() {
 // ============================================================
 void showResult(int pred,
                 float hum, float temp,
-                float n,   float p, float k,
-                float ph,  float ec,
-                String &outLabel, String &outRecom) {
-  char r[21];   // buffer baris LCD (20 char + null)
+                float n, float p, float k,
+                float ph, float ec,
+                String &outLabel, String &outRecom)
+{
+  char r[21]; // buffer baris LCD (20 char + null)
 
   // ========================================================
   // SERIAL MONITOR — semua data sejajar
@@ -310,18 +332,18 @@ void showResult(int pred,
   Serial.println("====================================");
   Serial.println("   HASIL ANALISIS KUALITAS TANAH   ");
   Serial.println("====================================");
-  Serial.printf(" Kelembaban : %5.1f %%\n",   hum);
+  Serial.printf(" Kelembaban : %5.1f %%\n", hum);
   Serial.printf(" Suhu       : %5.1f degC\n", temp);
   Serial.println("------------------------------------");
   Serial.printf(" N  : %6.0f mg/kg\n", n);
   Serial.printf(" P  : %6.0f mg/kg\n", p);
   Serial.printf(" K  : %6.0f mg/kg\n", k);
-  Serial.printf(" pH : %6.1f\n",        ph);
-  Serial.printf(" EC : %6d us/cm\n",    (int)ec);
+  Serial.printf(" pH : %6.1f\n", ph);
+  Serial.printf(" EC : %6d us/cm\n", (int)ec);
   Serial.println("====================================");
 
   // ========================================================
-  // HALAMAN 1 — Data Sensor (10 detik)
+  // HALAMAN 1 — Data Sensor
   //
   //   Baris 0: "💧XX.X%  🌡XX.XC "  ← Hum + Suhu + ikon
   //   Baris 1: "N:XXX P:XX K:XXX "  ← NPK
@@ -338,7 +360,8 @@ void showResult(int pred,
   lcd.print(r);
 
   int nextCol = 1 + strlen(r);
-  for (int i = nextCol; i < 11; i++) {
+  for (int i = nextCol; i < 11; i++)
+  {
     lcd.setCursor(i, 0);
     lcd.print(" ");
   }
@@ -382,54 +405,48 @@ void showResult(int pred,
 
   outRecom = "";
 
-  // ---- Tampilkan label kesuburan di Baris 1 ----
-  // LCD 20x4: lcdCenter otomatis menghitung padding
-  // "SANGAT RENDAH" (13 chr) -> pad=3, teks col 3-15, icon di col 1 & 17
-  // "RENDAH"        ( 6 chr) -> pad=7, teks col 7-12, icon di col 5 & 14
-  // "SEDANG"        ( 6 chr) -> pad=7, teks col 7-12, icon di col 5 & 14
-  // "TINGGI"        ( 6 chr) -> pad=7, teks col 7-12, icon di col 5 & 14
-  // "SANGAT TINGGI" (13 chr) -> pad=3, teks col 3-15, icon di col 1 & 17
-  switch (pred) {
-    case 0:  // Sangat Rendah — pad=3, teks col 3-15
-      outLabel = "Sangat Rendah";
-      lcdCenter(1, "SANGAT RENDAH");
-      lcdIcon(1, 1, ICON_LEAF);
-      lcdIcon(17, 1, ICON_LEAF);
-      Serial.println(" Status: SANGAT RENDAH");
-      break;
-    case 1:  // Rendah — pad=7, teks col 7-12
-      outLabel = "Rendah";
-      lcdCenter(1, "RENDAH");
-      lcdIcon(5, 1, ICON_LEAF);
-      lcdIcon(14, 1, ICON_LEAF);
-      Serial.println(" Status: RENDAH");
-      break;
-    case 2:  // Sedang — pad=7, teks col 7-12
-      outLabel = "Sedang";
-      lcdCenter(1, "SEDANG");
-      lcdIcon(5, 1, ICON_LEAF);
-      lcdIcon(14, 1, ICON_LEAF);
-      Serial.println(" Status: SEDANG");
-      break;
-    case 3:  // Tinggi — pad=7, teks col 7-12
-      outLabel = "Tinggi";
-      lcdCenter(1, "TINGGI");
-      lcdIcon(5, 1, ICON_LEAF);
-      lcdIcon(14, 1, ICON_LEAF);
-      Serial.println(" Status: TINGGI");
-      break;
-    case 4:  // Sangat Tinggi — pad=3, teks col 3-15
-      outLabel = "Sangat Tinggi";
-      lcdCenter(1, "SANGAT TINGGI");
-      lcdIcon(1, 1, ICON_LEAF);
-      lcdIcon(17, 1, ICON_LEAF);
-      Serial.println(" Status: SANGAT TINGGI");
-      break;
-    default:
-      outLabel = "Unknown";
-      lcdCenter(1, "UNKNOWN");
-      Serial.println(" Status: UNKNOWN");
-      break;
+  switch (pred)
+  {
+  case 0:
+    outLabel = "Sangat Rendah";
+    lcdCenter(1, "SANGAT RENDAH");
+    lcdIcon(1, 1, ICON_LEAF);
+    lcdIcon(17, 1, ICON_LEAF);
+    Serial.println(" Status: SANGAT RENDAH");
+    break;
+  case 1: // Rendah — pad=7, teks col 7-12
+    outLabel = "Rendah";
+    lcdCenter(1, "RENDAH");
+    lcdIcon(5, 1, ICON_LEAF);
+    lcdIcon(14, 1, ICON_LEAF);
+    Serial.println(" Status: RENDAH");
+    break;
+  case 2: // Sedang — pad=7, teks col 7-12
+    outLabel = "Sedang";
+    lcdCenter(1, "SEDANG");
+    lcdIcon(5, 1, ICON_LEAF);
+    lcdIcon(14, 1, ICON_LEAF);
+    Serial.println(" Status: SEDANG");
+    break;
+  case 3: // Tinggi — pad=7, teks col 7-12
+    outLabel = "Tinggi";
+    lcdCenter(1, "TINGGI");
+    lcdIcon(5, 1, ICON_LEAF);
+    lcdIcon(14, 1, ICON_LEAF);
+    Serial.println(" Status: TINGGI");
+    break;
+  case 4: // Sangat Tinggi — pad=3, teks col 3-15
+    outLabel = "Sangat Tinggi";
+    lcdCenter(1, "SANGAT TINGGI");
+    lcdIcon(1, 1, ICON_LEAF);
+    lcdIcon(17, 1, ICON_LEAF);
+    Serial.println(" Status: SANGAT TINGGI");
+    break;
+  default:
+    outLabel = "Unknown";
+    lcdCenter(1, "UNKNOWN");
+    Serial.println(" Status: UNKNOWN");
+    break;
   }
 
   lcdPrint(2, "Rekomendasi:        ");
@@ -439,46 +456,58 @@ void showResult(int pred,
   bool hasRecom = false;
 
   // ---- Rekomendasi Kelas 4 (Sangat Tinggi) ----
-  if (pred == 4) {
+  if (pred == 4)
+  {
     outRecom = "Pertahankan, kurangi pupuk kimia.";
     showRecom("Pertahankan!    ");
     Serial.println(" Tindakan: Pertahankan kondisi saat ini.");
     delay(1000);
-  } else {
+  }
+  else
+  {
     // ---- Rekomendasi berbasis defisiensi nutrisi ----
-    if (n < IDEAL_N * 0.8f) {
+    if (n < IDEAL_N * 0.8f)
+    {
       Serial.printf(" - N Rendah (%.0f mg/kg) -> Tambah Urea\n", n);
       showRecom("+Urea / Kompos  ");
       outRecom += "Tambah Urea, ";
       hasRecom = true;
     }
-    if (p < IDEAL_P * 0.8f) {
+    if (p < IDEAL_P * 0.8f)
+    {
       Serial.printf(" - P Rendah (%.0f mg/kg) -> Tambah SP-36\n", p);
       showRecom("+SP-36/Rock Phos");
       outRecom += "Tambah SP-36, ";
       hasRecom = true;
     }
-    if (k < IDEAL_K * 0.8f) {
+    if (k < IDEAL_K * 0.8f)
+    {
       Serial.printf(" - K Rendah (%.0f mg/kg) -> Tambah KCl\n", k);
       showRecom("+KCl / Abu Kayu ");
       outRecom += "Tambah KCl, ";
       hasRecom = true;
     }
-    if (ph < 5.5f) {
+    if (ph < 5.5f)
+    {
       Serial.printf(" - pH Asam (%.2f) -> Tambah Kapur Dolomit\n", ph);
       showRecom("+Kapur Dolomit  ");
       outRecom += "Tambah Kapur Dolomit, ";
       hasRecom = true;
-    } else if (ph > 7.5f) {
+    }
+    else if (ph > 7.5f)
+    {
       Serial.printf(" - pH Basa (%.2f) -> Tambah Belerang\n", ph);
       showRecom("+Belerang/Sulfur");
       outRecom += "Tambah Belerang, ";
       hasRecom = true;
     }
-    if (!hasRecom) {
+    if (!hasRecom)
+    {
       showRecom("  Kondisi Baik! ");
       outRecom = "Kondisi Baik!";
-    } else {
+    }
+    else
+    {
       outRecom.remove(outRecom.length() - 2); // Hilangkan koma dan spasi terakhir
     }
   }
@@ -489,13 +518,18 @@ void showResult(int pred,
 // ============================================================
 //  THINGSBOARD MQTT — Reconnect jika putus
 // ============================================================
-void tbReconnect() {
+void tbReconnect()
+{
   int retries = 0;
-  while (!tbClient.connected() && retries < 3) {
+  while (!tbClient.connected() && retries < 3)
+  {
     Serial.print("[MQTT] Connecting to ThingsBoard...");
-    if (tbClient.connect("ESP32_Soil_AI", TB_TOKEN, NULL)) {
+    if (tbClient.connect("ESP32_Soil_AI", TB_TOKEN, NULL))
+    {
       Serial.println(" CONNECTED!");
-    } else {
+    }
+    else
+    {
       Serial.printf(" FAILED (rc=%d), retry %d/3\n", tbClient.state(), retries + 1);
       retries++;
       delay(2000);
@@ -504,7 +538,8 @@ void tbReconnect() {
 }
 
 // ============================================================
-void setup() {
+void setup()
+{
   Serial.begin(115200);
   Serial2.begin(4800, SERIAL_8N1, RX2_PIN, TX2_PIN);
 
@@ -514,17 +549,20 @@ void setup() {
   digitalWrite(RE_PIN, LOW);
 
   // --- Inisialisasi SPIFFS ---
-  if (!SPIFFS.begin(true)) {
+  if (!SPIFFS.begin(true))
+  {
     Serial.println("SPIFFS Mount Failed! Data offline tidak bisa disimpan.");
-  } else {
+  }
+  else
+  {
     Serial.println("SPIFFS OK.");
   }
 
   // --- Inisialisasi LCD + custom characters ---
   lcd.begin();
   lcd.backlight();
-  lcd.createChar(ICON_DROP,   iconDrop);
-  lcd.createChar(ICON_LEAF,   iconLeaf);
+  lcd.createChar(ICON_DROP, iconDrop);
+  lcd.createChar(ICON_LEAF, iconLeaf);
   lcd.createChar(ICON_THERMO, iconThermo);
 
   // --- Splash screen animasi ---
@@ -536,20 +574,24 @@ void setup() {
   lcdCenter(1, "ke WiFi...");
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   int attempt = 0;
-  while (WiFi.status() != WL_CONNECTED && attempt < 20) {
+  while (WiFi.status() != WL_CONNECTED && attempt < 20)
+  {
     delay(500);
     Serial.print(".");
     attempt++;
   }
-  if (WiFi.status() == WL_CONNECTED) {
+  if (WiFi.status() == WL_CONNECTED)
+  {
     lcdPrint(2, "WiFi Terhubung!");
     Serial.println("\nWiFi Connected!");
-    tbClient.setServer(TB_SERVER, TB_PORT);  // Setup MQTT ThingsBoard
+    tbClient.setServer(TB_SERVER, TB_PORT);                   // Setup MQTT ThingsBoard
     configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov"); // Sync jam ke WIB (UTC+7)
-    
+
     // Sync data yang tertahan selama alat mati
     syncUnsentData();
-  } else {
+  }
+  else
+  {
     lcdPrint(2, "Gagal Konek WiFi");
     Serial.println("\nWiFi Failed!");
   }
@@ -564,11 +606,14 @@ void setup() {
 }
 
 // ============================================================
-void loop() {
+void loop()
+{
   // --- WIFI AUTO-RECONNECT (Non-Blocking) ---
-  if (WiFi.status() != WL_CONNECTED) {
+  if (WiFi.status() != WL_CONNECTED)
+  {
     static unsigned long lastWiFiCheck = 0;
-    if (millis() - lastWiFiCheck >= 10000) { // Coba konek ulang tiap 10 detik
+    if (millis() - lastWiFiCheck >= 10000)
+    { // Coba konek ulang tiap 10 detik
       Serial.println("[Wi-Fi] Terputus! Mencoba menyambung kembali...");
       WiFi.disconnect();
       WiFi.reconnect();
@@ -577,9 +622,11 @@ void loop() {
   }
 
   // --- MQTT KEEPALIVE ThingsBoard ---
-  if (WiFi.status() == WL_CONNECTED) {
-    if (!tbClient.connected()) tbReconnect();
-    tbClient.loop(); // wajib ada agar koneksi MQTT tidak timeout
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    if (!tbClient.connected())
+      tbReconnect();
+    tbClient.loop();
   }
 
   // 1. Kirim request Modbus ke sensor
@@ -596,25 +643,28 @@ void loop() {
 
   // 3. Baca balasan (19 byte)
   int index = 0;
-  while (Serial2.available() > 0 && index < 19) {
+  while (Serial2.available() > 0 && index < 19)
+  {
     values[index++] = Serial2.read();
   }
 
   // 4. Validasi & parse
-  if (index == 19 && values[0] == 0x01 && values[1] == 0x03 && values[2] == 0x0E) {
+  if (index == 19 && values[0] == 0x01 && values[1] == 0x03 && values[2] == 0x0E)
+  {
 
-    float hum  = (values[3]  << 8 | values[4])  / 10.0f;
-    float temp = (values[5]  << 8 | values[6])  / 10.0f;
-    float ec   = (float)(values[7]  << 8 | values[8]);
-    float ph   = (values[9]  << 8 | values[10]) / 10.0f;
-    float n    = (float)(values[11] << 8 | values[12]);
-    float p    = (float)(values[13] << 8 | values[14]);
-    float k    = (float)(values[15] << 8 | values[16]);
+    float hum = (values[3] << 8 | values[4]) / 10.0f;
+    float temp = (values[5] << 8 | values[6]) / 10.0f;
+    float ec = (float)(values[7] << 8 | values[8]);
+    float ph = (values[9] << 8 | values[10]) / 10.0f;
+    float n = (float)(values[11] << 8 | values[12]);
+    float p = (float)(values[13] << 8 | values[14]);
+    float k = (float)(values[15] << 8 | values[16]);
 
     // --- Sanity Check: N=0, P=0, K=0, EC=0 → sensor belum baca / tidak valid ---
     // Nilai NPK dan EC semuanya 0 tidak mungkin terjadi di tanah nyata.
     // Biasanya terjadi di pembacaan pertama atau saat koneksi RS485 belum stabil.
-    if (n == 0 && p == 0 && k == 0 && ec == 0) {
+    if (n == 0 && p == 0 && k == 0 && ec == 0)
+    {
       Serial.printf("[WARN] Data tidak valid — N:%.0f P:%.0f K:%.0f EC:%.0f pH:%.1f | Skip AI.\n",
                     n, p, k, ec, ph);
 
@@ -635,7 +685,8 @@ void loop() {
       lcdCenter(2, "N=P=K=EC = 0");
 
       // Baris 3: countdown animasi 3 detik
-      for (int c = 3; c > 0; c--) {
+      for (int c = 3; c > 0; c--)
+      {
         char cbuf[21];
         // "Coba ulang: 3 detik" = 19 char → pad=0
         snprintf(cbuf, sizeof(cbuf), "Coba ulang: %d detik", c);
@@ -645,11 +696,10 @@ void loop() {
       return; // skip prediksi & pengiriman data
     }
 
-    // Model rf_model.h: 5 fitur RAW (tanpa scaling) — N, P, K, pH, EC
     float features[5];
-    features[IDX_N]  = n;
-    features[IDX_P]  = p;
-    features[IDX_K]  = k;
+    features[IDX_N] = n;
+    features[IDX_P] = p;
+    features[IDX_K] = k;
     features[IDX_PH] = ph;
     features[IDX_EC] = ec;
 
@@ -666,20 +716,32 @@ void loop() {
 
     // --- Persiapkan Payload JSON Utama ---
     StaticJsonDocument<512> doc;
-    doc["humidity"]    = hum;
+    doc["humidity"] = hum;
     doc["temperature"] = temp;
-    doc["n"]           = n;
-    doc["p"]           = p;
-    doc["k"]           = k;
-    doc["ph"]          = ph;
-    doc["ec"]          = (int)ec;
-    doc["ai_label"]    = aiLabel;
+    doc["n"] = n;
+    doc["p"] = p;
+    doc["k"] = k;
+    doc["ph"] = ph;
+    doc["ec"] = (int)ec;
+    doc["ai_label"] = aiLabel;
     doc["recommendation"] = aiRecom;
+
+    time_t now;
+    time(&now);
+    if (now > 1600000000)
+    {
+      struct tm timeinfo;
+      localtime_r(&now, &timeinfo);
+      char tsBuf[25];
+      strftime(tsBuf, sizeof(tsBuf), "%Y-%m-%dT%H:%M:%S", &timeinfo);
+      doc["ts_iso"] = tsBuf;
+    }
 
     bool sentOnline = false;
 
     // --- 1. Coba Kirim Telemetri ke ThingsBoard via MQTT ---
-    if (tbClient.connected()) {
+    if (tbClient.connected())
+    {
       String mqttPayload;
       serializeJson(doc, mqttPayload);
 
@@ -687,35 +749,43 @@ void loop() {
       bool success = tbClient.publish("v1/devices/me/telemetry", mqttPayload.c_str());
       unsigned long end_mqtt = millis();
 
-      if (success) {
+      if (success)
+      {
         Serial.printf("[MQTT] Data terkirim ke ThingsBoard. (Latensi: %lu ms)\n", (end_mqtt - start_mqtt));
         sentOnline = true;
-        
+
         // Coba sinkronisasi sisa data offline (jika ada) karena koneksi bagus
         syncUnsentData();
-      } else {
+      }
+      else
+      {
         Serial.println("[MQTT] Gagal kirim ke ThingsBoard.");
       }
-    } else {
+    }
+    else
+    {
       Serial.println("[MQTT] Tidak terhubung ke ThingsBoard.");
     }
 
     // --- 2. Jika Gagal Kirim Online (Offline), Simpan ke Memori SPIFFS ---
-    if (!sentOnline) {
+    if (!sentOnline)
+    {
       // Sisipkan jam JIKA sudah punya jam yang valid dari NTP
       time_t now;
       time(&now);
-      if (now > 1600000000) {
-        doc["epoch_ms"]  = (unsigned long long)now * 1000ULL;
+      if (now > 1600000000)
+      {
+        doc["epoch_ms"] = (unsigned long long)now * 1000ULL;
       }
-      
+
       String currentData;
       serializeJson(doc, currentData);
       saveDataLocally(currentData);
       Serial.println("[Offline] Data aman, ditampung sementara di memori SPIFFS.");
     }
-
-  } else {
+  }
+  else
+  {
     // ========================================================
     // HALAMAN ERROR — Clean layout
     // ========================================================
